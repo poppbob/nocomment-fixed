@@ -1,0 +1,207 @@
+Some useful queries on the database:
+
+Number of hits
+select max(id) from hits;
+
+Is dbscan up to date? (aka: is this zero)
+select count(*) from dbscan_to_update;
+
+How many clusters are there? (fast)
+select count(*) from dbscan where cluster_parent is null and disjoint_rank>0;
+
+Old query (april 1), VERY SLOW, gets ALL tracks EVER, sorted by in-game distance traveled over the course of the track
+select * from (select tracks.id as track_id, tracks.dimension, start.x as startx, start.z as startz, last.x as lastx, last.z as lastz, start.x-last.x as dx, start.z-last.z as dz from tracks left outer join hits as start on tracks.first_hit_id=start.id left outer join hits as last on tracks.last_hit_id=last.id) tmp where abs(lastx) > 10 and abs(lastz) > 10 and abs(abs(lastx)-abs(lastz)) > 10 order by dx*dx+dz+dz desc;
+
+Old query (april 4), reasonably fast (<20 seconds), gets all players sorted by the number of times they've logged in. data is heavily skewed by legacy import, and it ends up just showing what players were online for most of the legacy hits in 2018 / 2019.
+select players.*, tmp.cnt from (select player_id, count(*) as cnt from player_sessions group by player_id) tmp inner join players on tmp.player_id = players.id order by tmp.cnt desc limit 1000;
+
+Old query (april 5), used in online.sh, gets stats on player, fast
+select to_timestamp("join"/1000) as start,to_timestamp("leave"/1000) as end FROM player_sessions WHERE server_id = 1 and player_id=7 order by upper(range) desc limit 10;
+
+April 6, gets the top 50 largest cluster by number of chunks contained, fast
+select x*16 as block_x,z*16 as block_z,disjoint_size as num_chunks_in_cluster,dimension,server_id,is_core,cluster_parent,disjoint_rank from dbscan WHERE cluster_parent IS NULL AND disjoint_rank > 0 order by disjoint_size desc limit 50;
+
+April 7, sanity check, should return the same number twice, sums up root sizes and compares to number of child nodes, pretty slow.
+begin; select sum(disjoint_size) from dbscan where cluster_parent is null and disjoint_rank>0; select count(*) from dbscan where cluster_parent is not null or is_core; commit;
+
+April 7, sanity check, should return N then N-1. only checks the biggest cluster though! verifies that dbscan properly tagged the size. it may return N then a number lower than N-1 if flattening hasn't happened yet, but this should only be a temporary / transient state. it should never return N then a number ≥N. fast.
+ select (select max(disjoint_size) from dbscan), (select sum(disjoint_size) from dbscan where cluster_parent = (select id from dbscan order by disjoint_size desc limit 1));
+
+Old query, april 8, don't run, will scan the entire hits table stupidly (ever since i removed the index on hits.created_at)
+select (select max(id) from hits where server_id=1) - (select id from hits where server_id=1 and created_at > (extract(epoch from now())*1000)::bigint - 1000*3600 order by created_at asc limit 1);
+
+Good sanity check query, april 11, verifies that every cluster has the same sum of child size as the parent size minus one (because the parent itself counts). this is good because it makes sure that all the cluster merging incremental code is functioning. pretty slow, takes 10 to 20 seconds.
+select * from (select sum(disjoint_size) AS children_sizes_sum, cluster_parent from dbscan where cluster_parent is not null group by cluster_parent) parents inner join (select id, disjoint_size from dbscan where cluster_parent is null and disjoint_rank>0) childs on parents.cluster_parent=childs.id where children_sizes_sum + 1 != disjoint_size;
+
+the previous query on steroids, june 29, don't run because it takes forever (40+ seconds). it verifies it at every level of the tree, including leafs. unnecessary tbh.
+select * from (select id, disjoint_size from dbscan) childs left outer join (select sum(disjoint_size) AS children_sizes_sum, cluster_parent from dbscan where cluster_parent is not null group by cluster_parent) parents on parents.cluster_parent=childs.id where coalesce(children_sizes_sum, 0) + 1 != disjoint_size;
+
+Simple sanity check on dbscan, april 11, honestly this should be a check constraint, reasonably fast
+select count(*) from dbscan where (disjoint_rank!=0 or disjoint_size!=1 or cluster_parent is not null or is_core) and not is_node;
+
+April 15, shows all legacy hits. fast to run.
+select * from (select last_hit_id from tracks where legacy) t left outer join hits on hits.id=t.last_hit_id;
+
+april 18, associations, fast
+select associations.cluster_id, associations.association, players.username, dbscan.x*16 as block_x, dbscan.z*16 as block_z, dbscan.dimension, dbscan.server_id from associations inner join dbscan on dbscan.id=associations.cluster_id inner join players on players.id=associations.player_id order by association desc;
+
+june 27, find all 8x overworld to nether teleports, takes a few minutes
+SELECT older_track.id AS ow_first_track, newer_track.id AS neth_second_track, older_last_hit.x AS ow_chunk_x, older_last_hit.z AS ow_chunk_z, newer_first_hit.x AS neth_chunk_x, newer_first_hit.z AS neth_chunk_z, newer_first_hit.created_at-older_last_hit.created_at AS gap_time_ms, older_last_hit.x*8*16 AS overworld_block_x, older_last_hit.z*8*16 As overworld_block_z FROM tracks AS newer_track INNER JOIN tracks AS older_track ON newer_track.prev_track_id=older_track.id INNER JOIN hits AS newer_first_hit ON newer_first_hit.id=newer_track.first_hit_id INNER JOIN hits AS older_last_hit ON older_last_hit.id=older_track.last_hit_id WHERE newer_track.dimension=-1 AND older_track.dimension=0 AND ABS(newer_first_hit.x-older_last_hit.x)<10 AND ABS(newer_first_hit.z-older_last_hit.z)<10 AND ABS(newer_first_hit.x)>100 AND ABS(newer_first_hit.z)>100 AND ABS(ABS(newer_first_hit.x)-ABS(newer_first_hit.z))>100
+
+may 28, show players that have been kicked & rejoined the most number of times in the last 24 hours
+select tmp.cnt as num_kicks, players.username from (select player_id, count(*) as cnt from player_sessions where range && int8range((extract(epoch from now())*1000)::bigint - 1000*3600*24*7, (extract(epoch from now())*1000)::bigint, '[]') group by player_id) tmp inner join players on tmp.player_id = players.id order by tmp.cnt desc;
+
+may 27, heatmap queries
+create table heatmap_overworld as (select x,z,count(*) as cnt from hits where server_id=1 and dimension=0 group by x,z);
+\copy heatmap_overworld to '/heatmap.csv' delimiter ',' csv;
+
+may 24, The Beautiful Query that locates a player from their username, properly traversing all tables efficiently. postgres is crap, so it can only do 2 without tricking the query planner into doing something stupid.
+WITH RECURSIVE
+player_ids AS MATERIALIZED (
+    SELECT
+        DISTINCT id AS player_id
+    FROM
+        players
+    WHERE
+        LOWER(username) IN ('usernames', 'go here')
+    LIMIT 2
+),
+initial AS (
+    SELECT
+        cluster_id,
+        cluster_id,
+        FALSE
+    FROM
+        associations
+    INNER JOIN player_ids
+        ON player_ids.player_id = associations.player_id
+    GROUP BY cluster_id
+),
+tmp (child, parent, root) AS (
+    SELECT
+        *
+    FROM
+        initial
+    UNION ALL
+        SELECT
+            tmp.child,
+            CASE WHEN
+                dbscan.cluster_parent IS NULL THEN tmp.parent
+                ELSE dbscan.cluster_parent
+            END,
+            dbscan.cluster_parent IS NULL
+        FROM
+            tmp
+            INNER JOIN dbscan
+                ON tmp.parent = dbscan.id
+        WHERE
+            NOT tmp.root
+),
+leaf_to_root AS MATERIALIZED (
+    SELECT
+        child,
+        parent
+    FROM
+        tmp
+    WHERE
+        tmp.root
+),
+scorings AS (
+    SELECT
+        leaf_to_root.parent,
+        associations.player_id,
+        SUM(associations.association) AS strength
+    FROM
+        associations
+        INNER JOIN leaf_to_root
+            ON leaf_to_root.child = associations.cluster_id
+        INNER JOIN player_ids
+            ON player_ids.player_id = associations.player_id
+    GROUP BY leaf_to_root.parent, associations.player_id
+)
+SELECT
+    scorings.strength,
+    players.username,
+    dbscan.x * 16 AS block_x,
+    dbscan.z * 16 AS block_z,
+    dbscan.dimension,
+    dbscan.server_id
+FROM
+    scorings
+    INNER JOIN dbscan
+        ON dbscan.id = scorings.parent
+    INNER JOIN players
+        ON players.id = scorings.player_id
+ORDER BY strength DESC;
+
+may 9, list players at a given base, by cluster id
+WITH RECURSIVE tmp AS (SELECT id, disjoint_rank FROM dbscan WHERE id = 68), clusters AS (SELECT * FROM tmp UNION SELECT dbscan.id, dbscan.disjoint_rank FROM dbscan INNER JOIN clusters ON dbscan.cluster_parent = clusters.id WHERE clusters.disjoint_rank > 0) SELECT * FROM (SELECT player_id, SUM(association) AS strength FROM associations INNER JOIN clusters ON clusters.id = associations.cluster_id GROUP BY associations.player_id) AS assc LEFT OUTER JOIN players ON assc.player_id = players.id ORDER BY strength DESC;
+
+may 2, recent hits
+SELECT tracks.id, tracks.server_id, tracks.dimension, last_hit.x, last_hit.z FROM tracks LEFT OUTER JOIN hits AS first_hit ON first_hit.id = tracks.first_hit_id LEFT OUTER JOIN hits AS last_hit ON last_hit.id = tracks.last_hit_id WHERE first_hit.created_at < tracks.updated_at - 60 * 1000 AND tracks.updated_at > (EXTRACT(EPOCH FROM NOW())*1000)::BIGINT - 10000;
+
+april 15, traverse track history by following prev
+with recursive track_hist as (select 487900 as track_id union select t.prev_track_id from tracks t inner join track_hist on track_hist.track_id = t.id where t.prev_track_id is not null) select * from track_hist;
+
+april 11, get all chunk coords within a given cluster
+WITH RECURSIVE tmp AS (SELECT id, disjoint_size FROM dbscan WHERE id = 606), clusters AS (SELECT * FROM tmp UNION SELECT dbscan.id, dbscan.disjoint_size FROM dbscan INNER JOIN clusters ON dbscan.cluster_parent = clusters.id WHERE clusters.disjoint_size > 1) SELECT x, z FROM clusters INNER JOIN dbscan ON dbscan.id = clusters.id;
+
+july 3, get all chat in the last 5 minutes, takes about a second
+with cht as (select * from chat where server_id=1 and created_at > (extract(epoch from now())*1000)::bigint - 300000), src as (select created_at, (select replace(replace(string_agg(trim('"' from (x->'text')::text), ''), '\u003c', '<'), '\u003e', '>') from json_array_elements(data->'extra') as y(x)) as text from cht), cte as (select *, lead(created_at) over (partition by text order by created_at) nexttime from src) select text, to_timestamp(created_at/1000.0) as when from cte where created_at<nexttime-10000 or nexttime is null order by created_at desc;
+
+idk sometime in july, quick and dirty unformatted get all chat mentioning xz_9 in the last 24 hours
+select chat from chat where created_at > (extract(epoch from now())*1000)::bigint - 86400000 and lower(chat::text) like '%xz_9%';
+
+july 3, biggest stashes slurped in the last 24 hours, grouped by chunk, takes like a minute but is worth
+with interesting as materialized (select block_state from block_states where (name like '%chest%' and name not like '%ender%') or name like '%shulker%') select chunk_x*16 as block_x, chunk_z*16 as block_z, count(*) as cnt from (select x>>4 as chunk_x, z>>4 as chunk_z from blocks where created_at > (extract(epoch from now())*1000.0)::bigint - 86400000 and block_state in (select * from interesting)) tmp group by chunk_x, chunk_z order by cnt desc;
+
+july 3, biggest stashes slurped in the last 8 hours, grouped by cluster, takes like a minute but is VERY WORTH
+with recursive interesting as materialized (select block_state from block_states where (name like '%chest%' and name not like '%ender%') or name like '%shulker%'), chunk_nums as (select chunk_x, chunk_z, count(*) as cnt, avg(x) as avgx, avg(y) as avgy, avg(z) as avgz, (array_agg(x order by y desc))[1] as firstx, max(y) as firsty, (array_agg(z order by y desc))[1] as firstz from (select x>>4 as chunk_x, z>>4 as chunk_z, x, y, z from blocks where created_at > (extract(epoch from now())*1000.0)::bigint - 3600*8*1000 and block_state in (select * from interesting)) tmp group by chunk_x, chunk_z), lookup as (select id, cnt, avgx, avgy, avgz, firstx, firsty, firstz from chunk_nums inner join dbscan on chunk_nums.chunk_x=dbscan.x and chunk_nums.chunk_z=dbscan.z where dbscan.dimension=0 and dbscan.server_id=1 and (dbscan.cluster_parent is not null or dbscan.is_core)), initial as (select id, id, false from lookup), tmp(child, parent, root) as (select * from initial union all select tmp.child, case when dbscan.cluster_parent is null then tmp.parent else dbscan.cluster_parent end, dbscan.cluster_parent is null from tmp inner join dbscan on tmp.parent=dbscan.id where not tmp.root), leaf_to_root as materialized (select child, parent from tmp where tmp.root), aggr as (select leaf_to_root.parent, sum(lookup.cnt) as cnt, avg(avgx) as avgx, avg(avgy) as avgy, avg(avgz) as avgz, (array_agg(firstx order by firsty desc))[1] as firstx, max(firsty) as firsty, (array_agg(firstz order by firsty desc))[1] as firstz from lookup inner join leaf_to_root on leaf_to_root.child=lookup.id group by leaf_to_root.parent) select dbscan.x*16 as block_x, dbscan.z*16 as block_z, cnt, avgx::bigint, avgy::bigint, avgz::bigint, firstx, firsty, firstz from dbscan inner join aggr on aggr.parent=dbscan.id order by cnt desc;
+
+july 5, signs
+select x,y,z,array_to_string((select array_agg(trim('"' from (x->'extra'->0->'text')::text)) from json_array_elements(data) as y(x)), '\n') from (select nbt_decode(nbt)::json as data,x,y,z from signs) tmp;
+
+list a given cluster's associations, cli
+select username, sum(association) as assc from associations inner join players on players.id = associations.player_id where cluster_id=207213431 group by username order by assc desc;
+
+locate a player, only using associations from the last 21 days
+select assc, dbscan.x*16 as block_x, dbscan.z*16 as block_z, cluster_id from (select cluster_id, sum(association) as assc from associations where player_id = (select id from players where lower(username)='?') and associations.created_at > (extract(epoch from now())*1000)::bigint - 3600::bigint*1000*24*21 group by cluster_id) tmp inner join dbscan on dbscan.id = tmp.cluster_id order by assc desc;
+
+strongest associations of the last week nov 22
+select x*16 as block_x, z*16 as block_z, username, sum(association) as assc from associations inner join players on players.id = associations.player_id inner join dbscan on dbscan.id = associations.cluster_id  where created_at > (extract(epoch from now())*1000)::bigint - 3600::bigint*1000*24*7 group by block_x, block_z, username order by assc desc;
+
+fix associations root updating, mar 7
+WITH assc AS MATERIALIZED (SELECT DISTINCT cluster_id AS id FROM associations), update_map AS MATERIALIZED (SELECT id AS old_id, cluster_parent AS new_id FROM dbscan INNER JOIN assc USING (id) WHERE cluster_parent IS NOT NULL) UPDATE associations SET cluster_id = (SELECT new_id FROM update_map WHERE old_id = cluster_id) WHERE cluster_id IN (SELECT old_id FROM update_map);
+
+the july 3 biggest stashes query but fixed with guardrails to force the postgres query planner to do the right thing
+with recursive interesting as materialized (select block_state from block_states where (name like '%chest%' and name not like '%ender%') or name like '%shulker%'), chunk_nums as (select chunk_x, chunk_z, count(*) as cnt, avg(x) as avgx, avg(y) as avgy, avg(z) as avgz, (array_agg(x order by y desc))[1] as firstx, max(y) as firsty, (array_agg(z order by y desc))[1] as firstz from (select x>>4 as chunk_x, z>>4 as chunk_z, x, y, z from blocks where created_at > (extract(epoch from now())*1000.0)::bigint - 3600*8*1000 and block_state in (select * from interesting)) tmp group by chunk_x, chunk_z), lookup as (select (select id from dbscan where dbscan.dimension=0 and dbscan.server_id=1 and (dbscan.cluster_parent is not null or dbscan.is_core) and dbscan.x=chunk_nums.chunk_x and dbscan.z=chunk_nums.chunk_z) as id, cnt, avgx, avgy, avgz, firstx, firsty, firstz from chunk_nums), initial as (select id, id, false from lookup where id is not null), traversal(child, parent, root) as (select * from initial union all select child, case when cluster_parent is null then parent else cluster_parent end, cluster_parent is null from (with forced_cte as materialized (select traversal.child, traversal.parent, (select dbscan.cluster_parent from dbscan where dbscan.id=traversal.parent) as cluster_parent from traversal where not traversal.root) select * from forced_cte) tmp), leaf_to_root as materialized (select child, parent from traversal where traversal.root), aggr as (select leaf_to_root.parent, sum(lookup.cnt) as cnt, avg(avgx) as avgx, avg(avgy) as avgy, avg(avgz) as avgz, (array_agg(firstx order by firsty desc))[1] as firstx, max(firsty) as firsty, (array_agg(firstz order by firsty desc))[1] as firstz from lookup inner join leaf_to_root on leaf_to_root.child=lookup.id group by leaf_to_root.parent) select dbscan.x*16 as block_x, dbscan.z*16 as block_z, cnt, avgx::bigint, avgy::bigint, avgz::bigint, firstx, firsty, firstz from dbscan inner join aggr on aggr.parent=dbscan.id order by cnt desc;
+
+may 13, players by online time in the last week
+select tmp.duration/3600000.0 as online_time_hours, players.username from (select player_id, sum(coalesce(leave, (extract(epoch from now())*1000)::bigint)-lower(range)) as duration from player_sessions where range && int8range((extract(epoch from now())*1000)::bigint - 1000*3600*24*7, (extract(epoch from now())*1000)::bigint, '[]') group by player_id) tmp inner join players on tmp.player_id = players.id order by tmp.duration desc;
+
+july 3, check if hause added a new death message
+SELECT * FROM (SELECT DISTINCT template FROM chat_death WHERE player_2 IS NOT NULL) tmp LEFT OUTER JOIN death_templates USING (template) WHERE death_templates.template IS NULL;
+
+july 3, best pvpers
+select killed_by, count(*) from deaths where killed_by is not null group by killed_by order by count desc;
+
+july 3, players that have been killed by another player most often
+select died, count(*) from deaths where killed_by is not null group by died order by count desc;
+
+july 3, search for word
+select * from chat_player_message where message_vec @@ to_tsquery('english', 'baritone');
+
+july 3, most active chatters
+select author, count(*) from chat_player_message group by author order by count desc;
+
+july 12, highway stats BAD DONT USE LOL
+explain analyze create table highway_stats as (select direction_x, direction_z, dimension, month, count(*) as num_hits from (select sign(x) as direction_x, sign(z) as direction_z, dimension, created_at / (2592000000::bigint) - 610 as month from hits where (not legacy) and (server_id=1) and (abs(x)>10 or abs(z)>10) and (abs(x)<10 or abs(z)<10 or abs(abs(x)-abs(z))<10) and (dimension=0 or dimension=-1)) tmp group by direction_x, direction_z, dimension, month);
+
+august 2, ACTUAl highway stats daily
+explain analyze create table highway_day_stats as (select direction_x, direction_z, dimension, day, count(*) as num_hits from (select case when abs(x)<16 then 0 else sign(x) end as direction_x, case when abs(z)<16 then 0 else sign(z) end as direction_z, dimension, created_at / (86400000::bigint) as day from hits where (not legacy) and (server_id=1) and (abs(x)>64 or abs(z)>64) and (abs(x)<16 or abs(z)<16 or abs(abs(x)-abs(z))<16) and (dimension=0 or dimension=-1)) tmp group by direction_x, direction_z, dimension, day);
+
+august 3, reparse highway stats by highway overworld
+explain analyze create table highway_overworld_axis_by_day as (with input as (select * from highway_day_stats where dimension=0 and (direction_x=0 or direction_z=0)), temp as (select day, direction_x, direction_z, num_hits/day_total as fract from input inner join (select sum(num_hits) as day_total, day from input group by day) tot using (day)), days as (select distinct day from temp) select day, coalesce((select fract from temp where temp.day=days.day and direction_x=1 and direction_z=0), 0) as plus_x, coalesce((select fract from temp where temp.day=days.day and direction_x=-1 and direction_z=0), 0) as minus_x, coalesce((select fract from temp where temp.day=days.day and direction_x=0 and direction_z=1), 0) as plus_z, coalesce((select fract from temp where temp.day=days.day and direction_x=0 and direction_z=-1), 0) as minus_z from days order by day);
+
+by week
+explain analyze create table highway_overworld_axis_by_week as (with input as (select direction_x, direction_z, day, sum(num_hits) as num_hits from (select direction_x, direction_z, num_hits, day/7::integer as day from highway_day_stats where dimension=0 and (direction_x=0 or direction_z=0)) tmp group by direction_x, direction_z, day), temp as (select day, direction_x, direction_z, num_hits/day_total as fract from input inner join (select sum(num_hits) as day_total, day from input group by day) tot using (day)), days as (select distinct day from temp) select day, coalesce((select fract from temp where temp.day=days.day and direction_x=1 and direction_z=0), 0) as plus_x, coalesce((select fract from temp where temp.day=days.day and direction_x=-1 and direction_z=0), 0) as minus_x, coalesce((select fract from temp where temp.day=days.day and direction_x=0 and direction_z=1), 0) as plus_z, coalesce((select fract from temp where temp.day=days.day and direction_x=0 and direction_z=-1), 0) as minus_z from days order by day);

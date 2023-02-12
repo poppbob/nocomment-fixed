@@ -1,0 +1,47 @@
+plugins {
+    id 'java'
+    id 'com.github.johnrengelman.shadow' version '4.0.4'
+}
+
+group 'nocomment.master'
+version '1.0-SNAPSHOT'
+
+sourceCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compile 'org.postgresql:postgresql:42.2.14'
+    compile 'org.apache.commons:commons-dbcp2:2.7.0'
+    compile 'io.prometheus:simpleclient:0.9.0'
+    compile 'io.prometheus:simpleclient_hotspot:0.9.0'
+    compile 'io.prometheus:simpleclient_httpserver:0.9.0'
+    compile 'it.unimi.dsi:fastutil:8.1.0'
+    compile 'net.openhft:chronicle-map:3.20.2'
+    compile 'net.openhft:chronicle-values:2.20.6'
+    compile 'net.openhft:chronicle-bytes:2.20.7'
+    compile 'com.github.pengrad:java-telegram-bot-api:4.9.0'
+    compile 'com.google.code.gson:gson:2.8.7'
+
+    testImplementation 'junit:junit:4.13'
+}
+
+test {
+    useJUnit()
+}
+
+jar {
+    manifest {
+        attributes(
+                'Main-Class': 'nocomment.master.NoComment'
+        )
+    }
+}
+
+shadowJar {
+    classifier = 'unoptimised'
+}
+
+// TODO: fix proguard w/ new SlurpManager$AskStatus build.finalizedBy('optimize')
