@@ -1,2 +1,3 @@
 # nocomment-fixed
-nocomment fixed, no tutorials on how to use
+nocomment is a 
+hack from 2b2t
